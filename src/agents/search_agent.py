@@ -4,9 +4,8 @@ Three specialist searchers combined. Each enriches the state with realistic opti
 In production these would call live APIs (Skyscanner, IRCTC, etc.).
 """
 
-import json
-import re
 from src.utils.llm import call_agent
+from src.utils.json_utils import extract_json
 from src.utils.state import TripState
 
 FLIGHT_SYSTEM = """
@@ -79,13 +78,7 @@ Return JSON:
     ]
     result = call_agent(FLIGHT_SYSTEM, messages)
     text = result["text"]
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    return {}
+    return extract_json(text) or {}
 
 
 def _search_trains(state: TripState) -> dict:
@@ -135,13 +128,7 @@ Return JSON:
     ]
     result = call_agent(TRAIN_SYSTEM, messages)
     text = result["text"]
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    return {}
+    return extract_json(text) or {}
 
 
 def _search_ground(state: TripState) -> dict:
@@ -182,13 +169,7 @@ Return JSON:
     ]
     result = call_agent(GROUND_SYSTEM, messages)
     text = result["text"]
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    return {}
+    return extract_json(text) or {}
 
 
 def run(state: TripState) -> TripState:

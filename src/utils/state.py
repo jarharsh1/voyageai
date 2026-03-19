@@ -167,7 +167,8 @@ class TripState:
                     "rank": opt.rank,
                     "recommended": opt.recommended,
                 }
-                for opt in self.ranked_options
+                # After decision agent runs, ranked_options is populated; fall back to route_options
+                for opt in (self.ranked_options if self.ranked_options else self.route_options)
             ],
             "recommended_option_id": self.recommended_option_id,
             "approval_status": self.approval_status.value,

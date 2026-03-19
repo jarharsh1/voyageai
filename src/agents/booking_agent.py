@@ -96,24 +96,18 @@ Return JSON:
         }
     ]
 
-    import json, re
+    from src.utils.json_utils import extract_json
 
     result = call_agent(SYSTEM_PROMPT, messages)
-    text = result["text"]
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    data = extract_json(result["text"])
 
     booking = BookingResult()
-    if match:
-        try:
-            data = json.loads(match.group())
-            booking.success = bool(data.get("success", False))
-            booking.confirmed_legs = data.get("confirmed_legs", [])
-            booking.failed_legs = data.get("failed_legs", [])
-            booking.pnr_numbers = data.get("pnr_numbers", [])
-            booking.error_message = data.get("error_message", "")
-        except (json.JSONDecodeError, ValueError) as e:
-            booking.success = False
-            booking.error_message = f"Parse error: {e}"
+    if data:
+        booking.success = bool(data.get("success", False))
+        booking.confirmed_legs = data.get("confirmed_legs", [])
+        booking.failed_legs = data.get("failed_legs", [])
+        booking.pnr_numbers = data.get("pnr_numbers", [])
+        booking.error_message = data.get("error_message", "")
     else:
         booking.success = False
         booking.error_message = "No booking response received"

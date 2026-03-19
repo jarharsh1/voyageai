@@ -4,7 +4,8 @@ Classifies intent, routes to specialist agents, and drives the overall flow.
 """
 
 from src.utils.llm import call_agent
-from src.utils.state import TripState, Intent, TripType
+from src.utils.json_utils import extract_json
+from src.utils.state import TripState, TripType
 
 SYSTEM_PROMPT = """
 You are the Supervisor Agent of a production-grade multi-agent travel planning and booking system.
@@ -51,21 +52,16 @@ Return JSON with these fields:
 
     result = call_agent(SYSTEM_PROMPT, messages, use_thinking=True)
 
-    # Parse the classification from the response
-    import json, re
-
-    text = result["text"]
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
+    data = extract_json(result["text"])
+    if data:
+        trip_type_str = data.get("trip_type", "unknown")
         try:
-            data = json.loads(match.group())
-            trip_type_str = data.get("trip_type", "unknown")
-            state.intent.trip_type = TripType(trip_type_str) if trip_type_str in TripType._value2member_map_ else TripType.UNKNOWN
-            state.log("orchestrator", "done", f"Trip type: {state.intent.trip_type.value} | Agents: {data.get('agents_needed', [])}")
-        except (json.JSONDecodeError, ValueError):
+            state.intent.trip_type = TripType(trip_type_str)
+        except ValueError:
             state.intent.trip_type = TripType.UNKNOWN
-            state.log("orchestrator", "done", "Classification complete (fallback)")
+        state.log("orchestrator", "done", f"Trip type: {state.intent.trip_type.value} | Agents: {data.get('agents_needed', [])}")
     else:
-        state.log("orchestrator", "done", "Classification complete")
+        state.intent.trip_type = TripType.UNKNOWN
+        state.log("orchestrator", "done", "Classification complete (fallback)")
 
     return state

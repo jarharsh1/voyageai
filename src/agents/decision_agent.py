@@ -5,10 +5,9 @@ Flags conflicts, fragile connections, and trade-offs.
 Does not search for routes or execute bookings.
 """
 
-import json
-import re
 from src.utils.llm import call_agent
-from src.utils.state import TripState, RouteOption
+from src.utils.json_utils import extract_json
+from src.utils.state import TripState
 
 SYSTEM_PROMPT = """
 You are the Pricing & Ranking Agent combined with the Decision and Conflict Resolver Agent.
@@ -99,36 +98,30 @@ Return JSON:
 
     result = call_agent(SYSTEM_PROMPT, messages, use_thinking=True)
 
-    text = result["text"]
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group())
+    data = extract_json(result["text"])
+    if data:
+        ranked_map = {r["option_id"]: r for r in data.get("ranked_options", [])}
 
-            ranked_map = {r["option_id"]: r for r in data.get("ranked_options", [])}
+        ranked_options = []
+        for opt in state.route_options:
+            ranking = ranked_map.get(opt.option_id, {})
+            if ranking.get("reject"):
+                continue  # Drop fragile itineraries
+            opt.rank = ranking.get("rank", 99)
+            opt.convenience_score = float(ranking.get("convenience_score", 0.0))
+            opt.recommended = bool(ranking.get("recommended", False))
+            ranked_options.append(opt)
 
-            ranked_options = []
-            for opt in state.route_options:
-                ranking = ranked_map.get(opt.option_id, {})
-                if ranking.get("reject"):
-                    continue  # Drop fragile itineraries
-                opt.rank = ranking.get("rank", 99)
-                opt.convenience_score = float(ranking.get("convenience_score", 0.0))
-                opt.recommended = bool(ranking.get("recommended", False))
-                ranked_options.append(opt)
+        ranked_options.sort(key=lambda o: o.rank)
+        state.ranked_options = ranked_options
+        state.recommended_option_id = data.get("recommended_option_id", "")
+        state.summary = data.get("comparison_summary", "")
 
-            ranked_options.sort(key=lambda o: o.rank)
-            state.ranked_options = ranked_options
-            state.recommended_option_id = data.get("recommended_option_id", "")
-            state.summary = data.get("comparison_summary", "")
-
-            state.log(
-                "decision_agent",
-                "done",
-                f"{len(ranked_options)} option(s) ranked | Recommended: {state.recommended_option_id}",
-            )
-        except (json.JSONDecodeError, ValueError) as e:
-            state.add_error(f"Decision agent parse error: {e}")
+        state.log(
+            "decision_agent",
+            "done",
+            f"{len(ranked_options)} option(s) ranked | Recommended: {state.recommended_option_id}",
+        )
     else:
         state.add_error("Decision agent returned no parseable JSON")
 

@@ -152,8 +152,12 @@ def _from_dict(d: dict) -> TripState:
             ))
         return opts
 
-    trip.route_options = _parse_options(d.get("route_options", []))
-    trip.ranked_options = _parse_options(d.get("route_options", []))  # after decision node, route_options == ranked_options
+    # route_options holds the raw planning candidates; ranked_options holds the
+    # post-decision ranked list.  to_dict() emits both under "route_options" (the
+    # display list) by merging, so on round-trip both fields restore from the same key.
+    parsed = _parse_options(d.get("route_options", []))
+    trip.route_options = parsed
+    trip.ranked_options = parsed
 
     # Agent log
     trip.agent_log = [
@@ -223,12 +227,17 @@ def run_planning_pipeline(user_request: str) -> dict:
 def run_booking_pipeline(state_dict: dict, selected_option_id: str) -> dict:
     """
     Run booking after user approval.
-    Takes the existing state, sets approval + selection, re-runs from decision node.
+    Uses a dedicated single-node graph so we never re-run the planning pipeline.
     """
+    state_dict = dict(state_dict)  # shallow copy — don't mutate the caller's state
     state_dict["approval_status"] = ApprovalStatus.APPROVED.value
     state_dict["selected_option_id"] = selected_option_id
 
-    graph = build_graph()
-    # Re-enter at decision node to trigger the conditional booking edge
-    final_state = graph.invoke(state_dict)
-    return final_state
+    # Dedicated booking-only graph — starts and ends at the booking node
+    booking_graph = StateGraph(dict)
+    booking_graph.add_node("booking", _node_booking)
+    booking_graph.set_entry_point("booking")
+    booking_graph.add_edge("booking", END)
+    compiled = booking_graph.compile()
+
+    return compiled.invoke(state_dict)
