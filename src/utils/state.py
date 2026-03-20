@@ -184,6 +184,8 @@ class TripState:
                 if self.booking_result
                 else None
             ),
+            "calendar_conflicts": self.calendar_conflicts,
+            "existing_bookings": self.existing_bookings,
             "errors": self.errors,
             "agent_log": [
                 {"agent": log.agent_name, "status": log.status, "message": log.message}

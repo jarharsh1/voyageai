@@ -1,19 +1,23 @@
 """
 LangGraph orchestration graph for VoyageAI.
 
-Flow:
-  orchestrator → intent_agent → route_agent → search_agent
-                                                   ↓
-                                            decision_agent
-                                                   ↓
-                                          [APPROVAL GATE]
-                                                   ↓
-                                           booking_agent (on approval)
+Planning flow:
+  orchestrator → intent
+                    ├─ calendar_check  (parallel)
+                    └─ email_scan      (parallel)
+                    ↓  (fan-in)
+               route_agent → search_agent → decision_agent
+                                                  ↓
+                                         [APPROVAL GATE]
+
+Booking flow (separate graph, runs only after approval):
+  booking → calendar_event → email_confirmation → END
 
 Workflow types:
-- Sequential: orchestrator → intent → route → decision → approval → booking
-- Parallel-ready: search_agent runs flight+train+ground (can be parallelised)
+- Sequential: orchestrator → intent → route → decision
+- Parallel: calendar_check + email_scan run concurrently after intent
 - Conditional: booking only if approval_status == APPROVED
+- Post-booking: calendar event + email confirmation after successful booking
 """
 
 from __future__ import annotations
@@ -29,11 +33,12 @@ from src.agents import (
     search_agent,
     decision_agent,
     booking_agent,
+    calendar_agent,
+    email_agent,
 )
 
 
-# ─── Node wrappers ────────────────────────────────────────────────────────────
-# LangGraph nodes receive and return state dicts; we wrap our dataclass agents.
+# ─── Node wrappers ─────────────────────────────────────────────────────────────
 
 def _node_orchestrator(state: dict) -> dict:
     trip = _from_dict(state)
@@ -44,6 +49,18 @@ def _node_orchestrator(state: dict) -> dict:
 def _node_intent(state: dict) -> dict:
     trip = _from_dict(state)
     trip = intent_agent.run(trip)
+    return trip.to_dict()
+
+
+def _node_calendar_check(state: dict) -> dict:
+    trip = _from_dict(state)
+    trip = calendar_agent.run(trip)
+    return trip.to_dict()
+
+
+def _node_email_scan(state: dict) -> dict:
+    trip = _from_dict(state)
+    trip = email_agent.scan_inbox(trip)
     return trip.to_dict()
 
 
@@ -71,7 +88,19 @@ def _node_booking(state: dict) -> dict:
     return trip.to_dict()
 
 
-# ─── Conditional edge: route after decision ───────────────────────────────────
+def _node_calendar_event(state: dict) -> dict:
+    trip = _from_dict(state)
+    trip = calendar_agent.create_event_after_booking(trip)
+    return trip.to_dict()
+
+
+def _node_email_confirmation(state: dict) -> dict:
+    trip = _from_dict(state)
+    trip = email_agent.send_confirmation(trip)
+    return trip.to_dict()
+
+
+# ─── Conditional edges ─────────────────────────────────────────────────────────
 
 def _route_after_decision(state: dict) -> Literal["booking", "end"]:
     approval = state.get("approval_status", "pending")
@@ -80,7 +109,7 @@ def _route_after_decision(state: dict) -> Literal["booking", "end"]:
     return "end"
 
 
-# ─── State reconstruction helper ──────────────────────────────────────────────
+# ─── State reconstruction helper ───────────────────────────────────────────────
 
 def _from_dict(d: dict) -> TripState:
     """Reconstruct a TripState from a serialised dict (LangGraph state)."""
@@ -101,13 +130,19 @@ def _from_dict(d: dict) -> TripState:
 
     # Intent
     intent_data = d.get("intent", {})
+    trip_type_val = intent_data.get("trip_type", "unknown")
+    try:
+        trip_type = TripType(trip_type_val)
+    except ValueError:
+        trip_type = TripType.UNKNOWN
+
     trip.intent = Intent(
         origin=intent_data.get("origin", "Delhi"),
         destination=intent_data.get("destination", ""),
         travel_date=intent_data.get("travel_date", ""),
         return_date=intent_data.get("return_date", ""),
         passenger_count=int(intent_data.get("passenger_count", 1)),
-        trip_type=TripType(intent_data.get("trip_type", "unknown")) if intent_data.get("trip_type") in TripType._value2member_map_ else TripType.UNKNOWN,
+        trip_type=trip_type,
         priorities=intent_data.get("priorities", []),
         is_round_trip=bool(intent_data.get("is_round_trip", False)),
         is_international=bool(intent_data.get("is_international", False)),
@@ -152,9 +187,8 @@ def _from_dict(d: dict) -> TripState:
             ))
         return opts
 
-    # route_options holds the raw planning candidates; ranked_options holds the
-    # post-decision ranked list.  to_dict() emits both under "route_options" (the
-    # display list) by merging, so on round-trip both fields restore from the same key.
+    # to_dict() emits ranked_options (falling back to route_options) under "route_options".
+    # On round-trip both fields restore from the same key.
     parsed = _parse_options(d.get("route_options", []))
     trip.route_options = parsed
     trip.ranked_options = parsed
@@ -179,65 +213,87 @@ def _from_dict(d: dict) -> TripState:
     return trip
 
 
-# ─── Build the graph ──────────────────────────────────────────────────────────
+# ─── Planning graph ─────────────────────────────────────────────────────────────
 
 def build_graph() -> StateGraph:
+    """
+    Planning pipeline graph.
+
+    orchestrator → intent ──┬── calendar_check ─┐
+                            └── email_scan      ─┤ (fan-in via route)
+                                                  ↓
+                                         route → search → decision → END
+                                                              (approval gate)
+    """
     graph = StateGraph(dict)
 
-    # Register nodes
     graph.add_node("orchestrator", _node_orchestrator)
     graph.add_node("intent", _node_intent)
+    graph.add_node("calendar_check", _node_calendar_check)
+    graph.add_node("email_scan", _node_email_scan)
     graph.add_node("route", _node_route)
     graph.add_node("search", _node_search)
     graph.add_node("decision", _node_decision)
-    graph.add_node("booking", _node_booking)
 
-    # Sequential edges
     graph.set_entry_point("orchestrator")
     graph.add_edge("orchestrator", "intent")
-    graph.add_edge("intent", "route")
+
+    # Fan-out: calendar + email run in parallel after intent
+    graph.add_edge("intent", "calendar_check")
+    graph.add_edge("intent", "email_scan")
+
+    # Fan-in: both must complete before route planning
+    graph.add_edge("calendar_check", "route")
+    graph.add_edge("email_scan", "route")
+
     graph.add_edge("route", "search")
     graph.add_edge("search", "decision")
-
-    # Conditional: only book if approved
-    graph.add_conditional_edges(
-        "decision",
-        _route_after_decision,
-        {"booking": "booking", "end": END},
-    )
-    graph.add_edge("booking", END)
+    graph.add_edge("decision", END)
 
     return graph.compile()
 
 
-# ─── Public API ───────────────────────────────────────────────────────────────
+# ─── Booking graph ──────────────────────────────────────────────────────────────
+
+def build_booking_graph() -> StateGraph:
+    """
+    Post-approval booking pipeline.
+    booking → calendar_event → email_confirmation → END
+    """
+    graph = StateGraph(dict)
+
+    graph.add_node("booking", _node_booking)
+    graph.add_node("calendar_event", _node_calendar_event)
+    graph.add_node("email_confirmation", _node_email_confirmation)
+
+    graph.set_entry_point("booking")
+    graph.add_edge("booking", "calendar_event")
+    graph.add_edge("calendar_event", "email_confirmation")
+    graph.add_edge("email_confirmation", END)
+
+    return graph.compile()
+
+
+# ─── Public API ─────────────────────────────────────────────────────────────────
 
 def run_planning_pipeline(user_request: str) -> dict:
     """
-    Run the full planning pipeline (orchestrator → decision).
+    Run the full planning pipeline.
     Returns state dict with ranked options for human review.
     Does NOT book anything.
     """
     graph = build_graph()
     initial_state = TripState(user_request=user_request).to_dict()
-    final_state = graph.invoke(initial_state)
-    return final_state
+    return graph.invoke(initial_state)
 
 
 def run_booking_pipeline(state_dict: dict, selected_option_id: str) -> dict:
     """
     Run booking after user approval.
-    Uses a dedicated single-node graph so we never re-run the planning pipeline.
+    On success also creates a calendar event and sends a confirmation email.
     """
-    state_dict = dict(state_dict)  # shallow copy — don't mutate the caller's state
+    state_dict = dict(state_dict)  # shallow copy — don't mutate caller's state
     state_dict["approval_status"] = ApprovalStatus.APPROVED.value
     state_dict["selected_option_id"] = selected_option_id
 
-    # Dedicated booking-only graph — starts and ends at the booking node
-    booking_graph = StateGraph(dict)
-    booking_graph.add_node("booking", _node_booking)
-    booking_graph.set_entry_point("booking")
-    booking_graph.add_edge("booking", END)
-    compiled = booking_graph.compile()
-
-    return compiled.invoke(state_dict)
+    return build_booking_graph().invoke(state_dict)
